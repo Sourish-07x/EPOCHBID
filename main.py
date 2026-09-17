@@ -8,12 +8,19 @@ import asyncpg
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from collections import deque
+import time
 
 load_dotenv()
 
 # Global states
 SWARM_CONFIG = {"starting_bid": 10000}
-RECENT_LOGS = deque(maxlen=40)  # In-memory log buffer for the UI
+RECENT_LOGS = deque(maxlen=40)
+AUCTION_STATE = {
+    "status": "ACTIVE",      # ACTIVE, CLOSED
+    "timer_mode": "AUTO",    # AUTO, MANUAL
+    "last_bid_time": time.time(),
+    "countdown": 10
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,6 +57,10 @@ class BidRequest(BaseModel):
 
 @app.post("/bid")
 async def place_bid(bid: BidRequest):
+    global AUCTION_STATE
+    if AUCTION_STATE["status"] == "CLOSED":
+        raise HTTPException(status_code=400, detail="Auction is closed.")
+
     async with app.state.pool.acquire() as conn:
         try:
             async with conn.transaction(isolation='serializable'):
@@ -65,6 +76,10 @@ async def place_bid(bid: BidRequest):
                     bid.amount, bid.user_name
                 )
             
+            # Reset timer on valid bid
+            AUCTION_STATE["last_bid_time"] = time.time()
+            AUCTION_STATE["countdown"] = 10
+
             log_msg = f"₹{bid.amount:,} | {bid.user_name} (Lock Secured)"
             RECENT_LOGS.appendleft({"type": "success", "msg": log_msg})
             print(f"\033[92m[VALID] {log_msg}\033[0m")
@@ -78,12 +93,32 @@ async def place_bid(bid: BidRequest):
 
 @app.post("/api/reset")
 async def reset_auction():
-    global SWARM_CONFIG, RECENT_LOGS
+    global SWARM_CONFIG, RECENT_LOGS, AUCTION_STATE
     SWARM_CONFIG["starting_bid"] = 5000
     RECENT_LOGS.clear()
+    AUCTION_STATE["status"] = "ACTIVE"
+    AUCTION_STATE["last_bid_time"] = time.time()
+    AUCTION_STATE["countdown"] = 10
     async with app.state.pool.acquire() as conn:
         await conn.execute("UPDATE final_auction SET highest_bid = 5000, winner_name = 'System' WHERE id = 1")
     return {"status": "Database Reset"}
+
+@app.post("/api/auction/close")
+async def close_auction():
+    global AUCTION_STATE
+    AUCTION_STATE["status"] = "CLOSED"
+    return {"status": "Auction Closed"}
+
+@app.post("/api/auction/toggle-mode")
+async def toggle_mode():
+    global AUCTION_STATE
+    if AUCTION_STATE["timer_mode"] == "AUTO":
+        AUCTION_STATE["timer_mode"] = "MANUAL"
+    else:
+        AUCTION_STATE["timer_mode"] = "AUTO"
+        AUCTION_STATE["last_bid_time"] = time.time()
+        AUCTION_STATE["countdown"] = 10
+    return {"mode": AUCTION_STATE["timer_mode"]}
 
 @app.get("/api/locust/config")
 async def get_locust_config():
@@ -111,7 +146,26 @@ async def stop_locust():
 
 @app.get("/api/data")
 async def get_system_data():
-    data = {"db_online": False, "locust_state": "offline", "rps": 0, "failures": 0, "market": {}, "logs": list(RECENT_LOGS)}
+    global AUCTION_STATE
+    
+    # Handle Auto Countdown Logic
+    if AUCTION_STATE["status"] == "ACTIVE" and AUCTION_STATE["timer_mode"] == "AUTO":
+        elapsed = time.time() - AUCTION_STATE["last_bid_time"]
+        remaining = max(0, 10 - int(elapsed))
+        AUCTION_STATE["countdown"] = remaining
+        if remaining == 0:
+            AUCTION_STATE["status"] = "CLOSED"
+
+    data = {
+        "db_online": False, 
+        "locust_state": "offline", 
+        "rps": 0, 
+        "failures": 0, 
+        "market": {}, 
+        "logs": list(RECENT_LOGS),
+        "auction": AUCTION_STATE
+    }
+    
     try:
         async with app.state.pool.acquire() as conn:
             record = await conn.fetchrow("SELECT * FROM final_auction WHERE id = 1")
@@ -119,6 +173,7 @@ async def get_system_data():
             data["db_online"] = True
     except Exception:
         pass
+        
     async with httpx.AsyncClient() as client:
         try:
             res = await client.get("http://localhost:8089/stats/requests", timeout=1.0)
@@ -129,6 +184,7 @@ async def get_system_data():
                 data["failures"] = round(locust.get("fail_ratio", 0) * 100, 1)
         except Exception:
             pass
+            
     return data
 
 # --- FRONTEND UI ---
@@ -144,9 +200,9 @@ async def get_dashboard():
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800;900&family=JetBrains+Mono:wght@400;700;800&display=swap');
-            body { font-family: 'Inter', sans-serif; background-color: #030712; color: #f8fafc; background-image: radial-gradient(circle at 50% 0%, rgba(34, 211, 238, 0.08), transparent 60%), linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px); background-size: 100% 100%, 40px 40px, 40px 40px; background-attachment: fixed; }
+            body { font-family: 'Inter', sans-serif; background-color: #030712; color: #f8fafc; background-image: linear-gradient(to bottom, rgba(3, 7, 18, 0.88), rgba(3, 7, 18, 0.95)), url('https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=2000&auto=format&fit=crop'); background-size: cover; background-position: center; background-attachment: fixed; }
             .font-mono-num { font-family: 'JetBrains Mono', monospace; }
-            .glass-panel { background: rgba(10, 15, 30, 0.7); backdrop-filter: blur(24px); border: 1px solid rgba(34, 211, 238, 0.15); box-shadow: inset 0 0 20px rgba(34, 211, 238, 0.02), 0 20px 40px rgba(0,0,0,0.6); }
+            .glass-panel { background: rgba(10, 15, 30, 0.75); backdrop-filter: blur(24px); border: 1px solid rgba(34, 211, 238, 0.15); box-shadow: inset 0 0 20px rgba(34, 211, 238, 0.02), 0 20px 40px rgba(0,0,0,0.6); }
             .glow-text { text-shadow: 0 0 30px rgba(34, 211, 238, 0.6), 0 0 10px rgba(255,255,255,0.8); }
             .glow-red { text-shadow: 0 0 20px rgba(244, 63, 94, 0.6); }
             ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
@@ -160,7 +216,11 @@ async def get_dashboard():
                 <div class="flex items-center gap-4">
                     <h1 class="text-2xl font-black tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-500">EpochBid.</h1>
                     <div class="h-6 w-px bg-slate-700 mx-2"></div>
-                    <span class="text-sm font-bold text-slate-400 tracking-widest uppercase">Unified HFT Terminal</span>
+                    <!-- Countdown / Timer Status Pill -->
+                    <div onclick="toggleTimerMode()" id="timerPill" class="cursor-pointer bg-cyan-500/10 border border-cyan-500/30 text-cyan-400 px-3 py-1 rounded-full text-xs font-black font-mono-num tracking-wider flex items-center gap-2 hover:bg-cyan-500/20 transition">
+                        <div class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></div>
+                        <span id="timerText">AUTO COUNTDOWN: 10s</span>
+                    </div>
                 </div>
                 <div class="flex gap-3 items-center">
                     <button onclick="resetSystem()" class="bg-rose-500/10 text-rose-500 border border-rose-500/30 hover:bg-rose-500 hover:text-white px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-widest transition-all">Reset Engine</button>
@@ -176,13 +236,33 @@ async def get_dashboard():
             </div>
         </nav>
 
+        <!-- WINNER MODAL POPUP -->
+        <div id="winnerModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 hidden flex items-center justify-center p-4 animate-fade-in">
+            <div class="glass-panel p-8 rounded-3xl max-w-md w-full border-2 border-cyan-400 shadow-[0_0_50px_rgba(34,211,238,0.3)] text-center">
+                <div class="text-xs text-cyan-400 font-black uppercase tracking-widest mb-2">🎉 Auction Concluded</div>
+                <h2 class="text-3xl font-black text-white mb-6">Winning Bidder Verified</h2>
+                
+                <div class="bg-slate-900/80 border border-slate-700 p-6 rounded-2xl mb-6 space-y-3">
+                    <div>
+                        <div class="text-[10px] text-slate-500 uppercase font-bold">Winning Entity</div>
+                        <div id="modalWinner" class="text-xl font-black text-cyan-400 font-mono-num">...</div>
+                    </div>
+                    <div>
+                        <div class="text-[10px] text-slate-500 uppercase font-bold">Final Settlement Price</div>
+                        <div id="modalPrice" class="text-3xl font-black text-white font-mono-num">₹0</div>
+                    </div>
+                </div>
+
+                <button onclick="resetSystem()" class="w-full bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-slate-950 font-black tracking-widest uppercase py-3.5 rounded-xl shadow-lg transition-all">Start New Auction</button>
+            </div>
+        </div>
+
         <!-- Main Unified Grid Container -->
         <main class="flex-1 max-w-7xl mx-auto w-full px-6 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
             
             <!-- LEFT 2 COLUMNS: Market Dashboard & Chart -->
             <div class="lg:col-span-2 glass-panel p-6 rounded-3xl flex flex-col justify-between">
                 <div>
-                    <!-- Header Stats -->
                     <div class="flex flex-col sm:flex-row justify-between items-start mb-6">
                         <div>
                             <h2 class="text-xs text-slate-400 uppercase tracking-widest font-bold mb-2">Epoch GPU Cluster Valuation</h2>
@@ -201,13 +281,11 @@ async def get_dashboard():
                         </div>
                     </div>
                     
-                    <!-- Chart Area -->
                     <div class="bg-slate-950/80 border border-slate-800 rounded-2xl p-4 relative h-[260px] mb-6 shadow-inner">
                         <canvas id="liveChart"></canvas>
                     </div>
                 </div>
                 
-                <!-- Labeled Swarm Controls -->
                 <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 bg-slate-900/40 p-4 rounded-2xl border border-slate-700/50 backdrop-blur-md">
                     <div>
                         <label class="block text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 ml-0.5">Users</label>
@@ -233,12 +311,8 @@ async def get_dashboard():
             <!-- RIGHT COLUMN: Manual Terminal & Live Transaction Feed -->
             <div class="flex flex-col gap-6">
                 
-                <!-- Manual Terminal Box with Smart "Beat Highest" Helper -->
                 <div class="glass-panel p-6 rounded-3xl border-t-4 border-t-emerald-400">
-                    <div class="flex justify-between items-center mb-1">
-                        <h2 class="text-lg font-black text-white tracking-tight">Manual Terminal</h2>
-                        <button onclick="fillWinningBid()" class="text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 hover:bg-emerald-500 hover:text-slate-950 px-2 py-1 rounded transition-all shadow">⚡ Beat Highest</button>
-                    </div>
+                    <h2 class="text-lg font-black mb-1 text-white tracking-tight">Manual Terminal</h2>
                     <p class="text-xs text-slate-400 mb-4 font-medium">Inject a test transaction instantly.</p>
                     <div class="space-y-3">
                         <div>
@@ -249,12 +323,22 @@ async def get_dashboard():
                             <label class="block text-[10px] font-bold text-emerald-500 uppercase tracking-widest mb-1">Amount (₹)</label>
                             <input type="number" id="bidAmount" placeholder="0" class="w-full bg-slate-950/80 border border-slate-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-400 shadow-inner font-mono-num">
                         </div>
+                        
+                        <div>
+                            <label class="block text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5">Instant Increment Bids</label>
+                            <div class="grid grid-cols-4 gap-1.5">
+                                <button onclick="quickBid(100)" class="bg-slate-900 hover:bg-emerald-500 hover:text-slate-950 text-cyan-400 border border-cyan-500/30 text-[10px] font-bold py-2 rounded-lg font-mono-num transition shadow">+₹100</button>
+                                <button onclick="quickBid(500)" class="bg-slate-900 hover:bg-emerald-500 hover:text-slate-950 text-cyan-400 border border-cyan-500/30 text-[10px] font-bold py-2 rounded-lg font-mono-num transition shadow">+₹500</button>
+                                <button onclick="quickBid(1000)" class="bg-slate-900 hover:bg-emerald-500 hover:text-slate-950 text-cyan-400 border border-cyan-500/30 text-[10px] font-bold py-2 rounded-lg font-mono-num transition shadow">+₹1K</button>
+                                <button onclick="quickBid(5000)" class="bg-slate-900 hover:bg-emerald-500 hover:text-slate-950 text-cyan-400 border border-cyan-500/30 text-[10px] font-bold py-2 rounded-lg font-mono-num transition shadow">+₹5K</button>
+                            </div>
+                        </div>
+
                         <button onclick="placeBid()" class="w-full mt-2 bg-gradient-to-r from-emerald-500 to-emerald-400 hover:from-emerald-400 hover:to-emerald-300 text-slate-950 font-black tracking-widest uppercase py-3 rounded-xl shadow-[0_0_20px_rgba(16,185,129,0.3)] transition-all text-xs">Submit Transaction</button>
                         <div id="bidStatusMsg" class="text-center text-xs font-bold h-4 mt-2 opacity-0 transition-opacity"></div>
                     </div>
                 </div>
 
-                <!-- Live Transaction Feed / Logs Box -->
                 <div class="glass-panel p-6 rounded-3xl flex-1 flex flex-col min-h-[220px]">
                     <h3 class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3 flex items-center gap-2">
                         <div class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></div> Transaction Log Stream
@@ -270,7 +354,7 @@ async def get_dashboard():
 
         <script>
             let chartInstance = null;
-            let latestHighestBid = 0; // Stored to power the "Beat Highest" button
+            let latestHighestBid = 0;
             const ctx = document.getElementById('liveChart').getContext('2d');
             let gradient = ctx.createLinearGradient(0, 0, 0, 300);
             gradient.addColorStop(0, 'rgba(34, 211, 238, 0.4)'); gradient.addColorStop(1, 'rgba(34, 211, 238, 0.0)');
@@ -281,18 +365,30 @@ async def get_dashboard():
                 options: { responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, scales: { x: { display: false }, y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b', font: {family: 'JetBrains Mono', size: 10}, callback: function(value) { return '₹' + value.toLocaleString('en-IN'); } } } }, plugins: { legend: { display: false } } }
             });
 
-            // Smart helper to instantly beat the current swarm price
-            function fillWinningBid() {
-                const target = latestHighestBid > 0 ? latestHighestBid + 5000 : 15000;
-                document.getElementById('bidAmount').value = target;
-                if(!document.getElementById('userName').value) {
-                    document.getElementById('userName').value = "Sourish_Manual";
+            async function toggleTimerMode() {
+                const res = await fetch('/api/auction/toggle-mode', { method: 'POST' });
+                const data = await res.json();
+                if(data.mode === 'MANUAL') {
+                    document.getElementById('timerText').innerText = "MODE: MANUAL CLOSE";
                 }
             }
 
+            async function quickBid(increment) {
+                let user_name = document.getElementById('userName').value.trim();
+                if(!user_name) { user_name = "Sourish_Manual"; document.getElementById('userName').value = user_name; }
+                const amount = (latestHighestBid > 0 ? latestHighestBid : 5000) + increment;
+                
+                const res = await fetch('/bid', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({user_name, amount}) });
+                const data = await res.json();
+                const stat = document.getElementById('bidStatusMsg');
+                stat.innerText = res.ok ? `+₹${increment.toLocaleString('en-IN')} Bid Approved!` : data.detail;
+                stat.className = `text-center text-xs font-bold h-4 mt-2 opacity-100 ${res.ok ? 'text-emerald-400 glow-text' : 'text-rose-500 glow-red'}`;
+                if(res.ok) { document.getElementById('bidAmount').value = ""; setTimeout(() => stat.style.opacity = '0', 3000); }
+            }
+
             async function resetSystem() {
-                if(!confirm("Are you sure you want to HARD RESET the database and clear all logs?")) return;
                 await fetch('/api/reset', { method: 'POST' });
+                document.getElementById('winnerModal').classList.add('hidden');
                 chartInstance.data.labels = [];
                 chartInstance.data.datasets[0].data = [];
                 chartInstance.update();
@@ -330,7 +426,7 @@ async def get_dashboard():
                     if(data.db_online) {
                         dbInd.className = "w-2 h-2 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_8px_#34d399]"; dbTxt.className = "text-[10px] font-black text-emerald-400 uppercase tracking-widest";
                         if(data.market && Object.keys(data.market).length !== 0) {
-                            latestHighestBid = data.market.highest_bid; // Update global highest tracker
+                            latestHighestBid = data.market.highest_bid;
                             document.getElementById('priceDisplay').innerText = '₹' + latestHighestBid.toLocaleString('en-IN');
                             document.getElementById('winnerDisplay').innerText = data.market.winner_name;
                             
@@ -346,8 +442,22 @@ async def get_dashboard():
                         }
                     } else { dbInd.className = "w-2 h-2 rounded-full bg-rose-500"; dbTxt.className = "text-[10px] font-black text-slate-400 uppercase tracking-widest"; }
 
+                    // Auction Status & Countdown Handling
+                    if(data.auction) {
+                        if(data.auction.timer_mode === 'AUTO') {
+                            document.getElementById('timerText').innerText = `AUTO COUNTDOWN: ${data.auction.countdown}s`;
+                        } else {
+                            document.getElementById('timerText').innerText = `MODE: MANUAL CLOSE`;
+                        }
+
+                        if(data.auction.status === 'CLOSED') {
+                            document.getElementById('modalWinner').innerText = data.market.winner_name || 'System';
+                            document.getElementById('modalPrice').innerText = '₹' + (data.market.highest_bid || 0).toLocaleString('en-IN');
+                            document.getElementById('winnerModal').classList.remove('hidden');
+                        }
+                    }
+
                     const locInd = document.getElementById('locustIndicator'); const locTxt = document.getElementById('locustStatusText');
-                    // FIXED: Properly reset RPS and status when locust is 'stopped' or 'offline'
                     if(data.locust_state === 'offline' || data.locust_state === 'stopped') {
                         locInd.className = "w-2 h-2 rounded-full bg-slate-600"; locTxt.className = "text-[10px] font-black text-slate-400 uppercase tracking-widest";
                         document.getElementById('rpsDisplay').innerText = "0.0"; 
@@ -360,7 +470,6 @@ async def get_dashboard():
                         locTxt.innerText = "SWARM ACTIVE";
                     }
                     
-                    // Render Logs Stream
                     const logContainer = document.getElementById('logContainer');
                     logContainer.innerHTML = data.logs.map(log => {
                         if(log.type === 'success') return `<div class="text-emerald-400 bg-emerald-500/10 px-2 py-1.5 rounded border border-emerald-500/20">${log.msg}</div>`;
